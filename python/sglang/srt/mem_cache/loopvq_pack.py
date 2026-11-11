@@ -108,3 +108,12 @@ def regroup_for_encode(r: torch.Tensor, Lb: int, T: int, Tc: int,
     return x.reshape(n_blocks * Lb, n, H, D // c, c * Tc)
 
 
+def ungroup_after_decode(q: torch.Tensor, Lb: int, T: int, Tc: int,
+                         c: int) -> torch.Tensor:
+    """Inverse of regroup_for_encode: [Lc, n, H, D/c, c*Tc] -> [Lb*T, n, H, D]."""
+    Lc, n, H, NGp, G = q.shape
+    D = NGp * c
+    n_blocks = Lc // Lb
+    x = q.reshape(n_blocks, Lb, n, H, D, Tc)     # undo the (channel, step) flatten
+    x = x.permute(0, 5, 1, 2, 3, 4)              # [blk, m, l, n, H, D]
+    return x.reshape(n_blocks * Tc * Lb, n, H, D)
