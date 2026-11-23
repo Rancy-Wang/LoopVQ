@@ -100,51 +100,70 @@ def main():
         return tid, ch["message"].get("content") or "", ch.get("finish_reason")
 
     outs, failed = {}, 0
+    task = f"evalplus_{a.bench}"
+    stem = os.path.join(a.output_dir, f"{a.save_postfix}_{a.seed}_{task}")
+    os.makedirs(a.output_dir, exist_ok=True)
+    attempt_log = open(stem + "_generation_attempts.jsonl", "a", buffering=1)
     with ThreadPoolExecutor(a.num_concurrent) as ex:
-        futs = [ex.submit(gen, t) for t in tids]
+        futs = {ex.submit(gen, t): t for t in tids}
         for f in as_completed(futs):
             try:
                 tid, text, fin = f.result()
                 outs[tid] = (text, fin)
+                attempt_log.write(json.dumps({"task_id": tid, "resp": text,
+                                               "finish_reason": fin, "ok": True}) + "\n")
             except Exception as e:                  # keep the others; fail the cell at the end
                 failed += 1
+                attempt_log.write(json.dumps({"task_id": futs[f], "ok": False,
+                                               "error": str(e)}) + "\n")
                 print(f"[evalplus-reasoning] request failed: {e}", flush=True)
             done = len(outs) + failed
             if done % 10 == 0 or done == len(tids):  # progress, readable with tail on the eval log
                 stop = sum(fin == "stop" for _, fin in outs.values())
                 print(f"[evalplus-reasoning] {done}/{len(tids)} done ({stop} finished on their own, "
                       f"{failed} failed) {time.strftime('%H:%M:%S')}", flush=True)
+    attempt_log.close()
     if failed:
         sys.exit(f"{failed} requests failed; no result written")
-    task = f"evalplus_{a.bench}"
-    stem = os.path.join(a.output_dir, f"{a.save_postfix}_{a.seed}_{task}")
-    os.makedirs(a.output_dir, exist_ok=True)
     with open(stem + "_raw.jsonl", "w") as f:   # generations first, so scoring can be redone
         for tid in tids:
             f.write(json.dumps({"task_id": tid, "resp": outs[tid][0], "finish_reason": outs[tid][1]}) + "\n")
 
     bench = "humaneval" if a.bench == "humaneval" else "mbpp"
     rows, base_ok, plus_ok, finished = [], 0, 0, 0
+    scored_log = open(stem + "_scoring_attempts.jsonl", "a", buffering=1)
     for tid in tids:
         p, g = problems[tid], gt[tid]
         text, fin = outs[tid]
         finished += fin == "stop"
-        code = last_code_block(answer_part(text))
-        san = sanitize(code, entrypoint=p["entry_point"]) if code.strip() else ""
-        if code.strip() and not san.strip():
-            san = sanitize(p["prompt"] + code, entrypoint=p["entry_point"])
-        b, _ = untrusted_check(bench, san, p["base_input"], p["entry_point"],
-                               g["base"], p["atol"], g["base_time"])
-        q, _ = untrusted_check(bench, san, p["plus_input"], p["entry_point"],
-                               g["plus"], p["atol"], g["plus_time"])
+        san = ""
+        try:
+            code = last_code_block(answer_part(text))
+            san = sanitize(code, entrypoint=p["entry_point"]) if code.strip() else ""
+            if code.strip() and not san.strip():
+                san = sanitize(p["prompt"] + code, entrypoint=p["entry_point"])
+            b, _ = untrusted_check(bench, san, p["base_input"], p["entry_point"],
+                                   g["base"], p["atol"], g["base_time"])
+            q, _ = untrusted_check(bench, san, p["plus_input"], p["entry_point"],
+                                   g["plus"], p["atol"], g["plus_time"])
+        except Exception as exc:
+            scored_log.write(json.dumps({"task_id": tid, "resp": text, "finish_reason": fin, "sanitized": san,
+                                          "error": str(exc), "ok": False}) + "\n")
+            raise
         base_ok += b == PASS
         plus_ok += q == PASS
         rows.append({"task_id": tid, "resp": text, "finish_reason": fin, "sanitized": san,
                      "base": str(b), "plus": str(q)})
+        scored_log.write(json.dumps(rows[-1]) + "\n")
+    scored_log.close()
     n = len(tids)
     res = {task: {"pass@1,base": base_ok / n, "pass@1,plus": plus_ok / n, "n": n,
                   "finished": finished / n, "thinking": hybrid}}
     json.dump(res, open(stem + ".json", "w"))
+    with open(stem + "_protocol.json", "w") as f:
+        json.dump({"dataset_hash": hashcode, "task_ids": tids, "api_seed": a.seed,
+                   "temperature": a.temperature, "top_p": a.top_p,
+                   "max_gen_toks": a.max_gen_toks, "limit": a.limit}, f, indent=2)
     with open(stem + "_samples.jsonl", "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")

@@ -12,6 +12,7 @@ import signal
 import argparse
 import json
 import os
+import hashlib
 
 import lm_eval
 import lm_eval.tasks
@@ -41,6 +42,9 @@ def main():
     parser.add_argument("--base_url", type=str, default="http://localhost:30000/v1/chat/completions")
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--api-seed-mode", choices=("explicit", "legacy"), default="explicit",
+                        help="explicit sends --seed to the server; legacy preserves lm_eval's "
+                             "published default HTTP seed=1234 (client RNG still uses --seed)")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--num_concurrent", type=int, default=8)
     parser.add_argument("--output_dir", type=str, default="./reasoning_output")
@@ -81,6 +85,7 @@ def main():
             "max_retries": 3,
             "tokenized_requests": False,
             "timeout": args.timeout,
+            "seed": args.seed if args.api_seed_mode == "explicit" else 1234,
         },
         tasks=[args.task],
         task_manager=task_manager,
@@ -102,6 +107,15 @@ def main():
     with open(output_file, "w") as f:
         json.dump(results["results"], f, indent=4)
     print(f"Results saved to {output_file}")
+    with open(output_file[:-5] + "_protocol.json", "w") as f:
+        json.dump({"client_seed": args.seed, "api_seed_mode": args.api_seed_mode,
+                   "api_seed": args.seed if args.api_seed_mode == "explicit" else 1234,
+                   "temperature": args.temperature, "top_p": args.top_p,
+                   "max_gen_toks": args.max_gen_toks, "limit": args.limit,
+                   "n_samples": results.get("n-samples"),
+                   "dataset_documents_sha256": hashlib.sha256(json.dumps(
+                       [r.get("doc") for rows in results.get("samples", {}).values() for r in rows],
+                       sort_keys=True, default=str).encode()).hexdigest()}, f, indent=2)
 
     samples = results.get("samples")
     if samples:
@@ -117,6 +131,9 @@ def main():
                     row = {"task": task, "doc_id": r.get("doc_id"), "filter": r.get("filter"),
                            "target": r.get("target"), "filtered_resps": r.get("filtered_resps"),
                            "resps": r.get("resps")}
+                    # Retain the scored example and the original request arguments, allowing
+                    # each score to be joined with the HTTP audit's exact messages/payload.
+                    row.update(doc=r.get("doc"), arguments=r.get("arguments"))
                     row.update({k: v for k, v in r.items()
                                 if k in ("exact_match", "em", "f1", "acc", "finish_reason")})
                     f.write(json.dumps(row, default=str) + "\n")
