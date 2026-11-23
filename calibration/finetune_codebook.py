@@ -21,6 +21,7 @@ same layout -- the serving path does not change).
     python finetune_codebook.py --src ouro_1p4b_loopvq8b_g16_a7 --dst ouro_1p4b_loopvq8b_g16_a7e2e
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -34,6 +35,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from build_ouro_bundle import calib_texts, enable_layer_checkpointing, load_wikitext, make_fisher_cache_cls
 from ouro_cq import RopeInverter, rotate_half
+from reproduction_tracking import (Tracking, add_tracking_args, atomic_json,
+                                   atomic_torch_save, checkpoint_state,
+                                   file_sha256, restore_checkpoint)
 
 HERE = Path(__file__).resolve().parent
 ART = HERE / ".." / "experiments" / "artifacts"
@@ -127,7 +131,7 @@ class Coded(torch.nn.Module):
                         slot = l + (blk * self.Tc + gg // NG) * self.Lb
                         cbs.setdefault((slot, hh), [None] * NG)[gg % NG] = cb[blk * self.Lb + l, hh, gg].contiguous()
         b["codebooks"] = cbs
-        torch.save(b, path)
+        atomic_torch_save(path, b)
 
 
 def main():
@@ -170,7 +174,15 @@ def main():
                     help="N > 0: perplexity on the first N wikitext-2 TEST windows of --seq-len "
                          "tokens (positions after --sink), bf16 and with the src bundle; then exit")
     ap.add_argument("--ppl-out", default=None, help="append the --eval-ppl result to this JSON")
+    ap.add_argument("--gpqa-revision", help="pin the GPQA dataset repository revision")
+    ap.add_argument("--data-manifest", help="local calibration IDs/token IDs; never uploaded to W&B")
+    ap.add_argument("--provenance-manifest", help="immutable model/data/source manifest used for resume validation")
+    ap.add_argument("--checkpoint", help="atomically save a complete epoch boundary here")
+    ap.add_argument("--resume", help="restore an epoch boundary, including Adam and RNG state")
+    add_tracking_args(ap)
     a = ap.parse_args()
+    if not 0 < a.n_val < a.n_calib:
+        ap.error("need 0 < n-val < n-calib")
     dev = "cuda"
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16,
@@ -372,20 +384,63 @@ def main():
             print(f"[compound] R={R}: held-out KL {val(R):.4f}", flush=True)
         return
 
-    best = val()
-    print(f"[e2e] start: held-out KL {best:.4f}", flush=True)
-    trace["curve"].append((0, best))
-    if a.step_breakdown:
-        trace["steps_start"] = breakdown()
-        print(f"[e2e] per-step KL (start): {[round(x, 4) for x in trace['steps_start']]}", flush=True)
-    n_step = 0
-    best_state = (qk.cb.detach().clone(), qv.cb.detach().clone())
+    recipe = {key: getattr(a, key) for key in (
+        "n_calib", "n_val", "seq_len", "epochs", "lr", "sink", "train", "calib_data", "seed",
+        "compound", "rep_chunk", "grad_ckpt", "objective", "eval_every", "step_breakdown", "gpqa_revision")}
+    recipe.update(model=str(Path(a.model).resolve()),
+                  model_files={p.name: file_sha256(p) for p in Path(a.model).iterdir()
+                               if p.name in ("config.json", "tokenizer_config.json", "modeling_ouro.py")},
+                  src_files={p.name: file_sha256(p) for p in src.iterdir() if p.is_file()},
+                  input_ids_sha256=hashlib.sha256(b"".join(x.cpu().numpy().tobytes() for x in texts)).hexdigest(),
+                  provenance_sha256=file_sha256(a.provenance_manifest) if a.provenance_manifest else None)
+    tracking = Tracking(a, "finetune", recipe)
+    start_epoch, n_step, prior_elapsed = 0, 0, 0.0
+    if a.resume:
+        state = restore_checkpoint(a.resume, qk.cb, qv.cb, opt, recipe)
+        start_epoch, n_step = state["completed_epochs"], state["global_step"]
+        if not 0 <= start_epoch <= a.epochs or n_step != start_epoch * len(tr):
+            raise ValueError("Checkpoint is not a valid completed epoch boundary")
+        best, trace = state["best_kl"], state["trace"]
+        best_state = tuple(x.to(dev) for x in state["best_codebooks"])
+        prior_elapsed = state["elapsed_seconds"]
+        tracking.log({"event": "resume", "completed_epochs": start_epoch, "global_step": n_step,
+                      "resume_source_run_id": state["tracking"].get("wandb_run_id"),
+                      "validation/best_kl": best})
+        print(f"[e2e] resumed {start_epoch} completed epochs / {n_step} updates", flush=True)
+    else:
+        best = val()
+        print(f"[e2e] start: held-out KL {best:.4f}", flush=True)
+        trace["curve"].append((0, best))
+        if a.step_breakdown:
+            trace["steps_start"] = breakdown()
+            print(f"[e2e] per-step KL (start): {[round(x, 4) for x in trace['steps_start']]}", flush=True)
+        best_state = (qk.cb.detach().clone(), qv.cb.detach().clone())
+        tracking.log({"global_step": 0, "epoch": 0, "validation/kl": best, "validation/best_kl": best})
     t0 = time.time()
-    for ep in range(a.epochs):
+
+    def save_boundary(completed_epochs):
+        if a.checkpoint:
+            atomic_torch_save(a.checkpoint, checkpoint_state(
+                qk.cb, qv.cb, opt, recipe, completed_epochs, n_step, best, best_state,
+                trace, prior_elapsed + time.time() - t0, tracking.identity))
+        if a.trace:
+            atomic_json(a.trace, {**trace, "best": best, "completed_epochs": completed_epochs,
+                                  "global_step": n_step})
+
+    if not a.resume:
+        save_boundary(0)
+    for ep in range(start_epoch, a.epochs):
+        epoch_started = time.time()
         trl = 0.0
-        for x in tr:
-            trl += train_step(x) / len(tr)
+        for sample_index, x in enumerate(tr):
+            step_started = time.time()
+            loss = train_step(x)
+            trl += loss / len(tr)
             n_step += 1
+            tracking.log({"global_step": n_step, "epoch": ep + 1,
+                          "train/sample_index": sample_index, "train/kl": loss,
+                          "train/lr": opt.param_groups[0]["lr"],
+                          "train/step_seconds": time.time() - step_started})
             if a.eval_every and n_step % a.eval_every == 0 and n_step % len(tr):
                 trace["curve"].append((n_step, val()))
         v = val()
@@ -394,17 +449,25 @@ def main():
         if v < best:
             best = v
             best_state = (qk.cb.detach().clone(), qv.cb.detach().clone())
+        tracking.log({"global_step": n_step, "epoch": ep + 1, "train/epoch_kl": trl,
+                      "validation/kl": v, "validation/best_kl": best,
+                      "epoch_seconds": time.time() - epoch_started,
+                      "remaining_epochs_eta_seconds": (time.time() - t0) / (ep + 1 - start_epoch) * (a.epochs - ep - 1)})
+        save_boundary(ep + 1)
     with torch.no_grad():
         qk.cb.copy_(best_state[0]); qv.cb.copy_(best_state[1])
     joint = sum(run(x, False) for x in va) / len(va)          # the served objective, for reference
     print(f"[e2e] held-out joint KL of the selected codebooks {joint:.4f}", flush=True)
+    tracking.log({"global_step": n_step, "validation/selected_joint_kl": joint,
+                  "validation/best_kl": best})
     if a.trace:
         trace["best"] = best
         if a.step_breakdown:
             trace["steps_end"] = breakdown()
             print(f"[e2e] per-step KL (best): {[round(x, 4) for x in trace['steps_end']]}", flush=True)
-        Path(a.trace).write_text(json.dumps(trace, indent=1))
+        atomic_json(a.trace, trace)
     if a.no_save:
+        tracking.finish(0)
         return
     dst = ART / a.dst
     dst.mkdir(parents=True, exist_ok=True)
@@ -417,8 +480,9 @@ def main():
                             "held_out_kl": best, "held_out_joint_kl": joint, "compound": a.compound,
                             "objective": "final-loop KL(p_clean || p_quant)" if a.objective == "joint"
                             else "sum_t KL(p_clean || p_quant, only loop step t quantized)"}
-    (dst / "build_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False))
+    atomic_json(dst / "build_info.json", info)
     print(f"[e2e] best held-out KL {best:.4f} -> {dst}")
+    tracking.finish(0)
 
 
 if __name__ == "__main__":

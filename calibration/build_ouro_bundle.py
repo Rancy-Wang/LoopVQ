@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from ouro_cq import GROUPERS, RopeInverter, group_loop, loop_slot_map, weighted_kmeans
+from reproduction_tracking import Tracking, add_tracking_args, atomic_json, json_digest
 
 WIKI = "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1"
 
@@ -87,6 +88,8 @@ def calib_key(args, model_path, n_slots):
         key["target"] = args.calib_target
     if getattr(args, "calib_data", "wikitext") != "wikitext":
         key["data"] = args.calib_data
+    if getattr(args, "gpqa_revision", None):
+        key["gpqa_revision"] = args.gpqa_revision
     return key
 
 
@@ -129,8 +132,10 @@ def calib_texts(args, tok, dev):
         # with their choices, answer and explanation; diamond stays unseen as an eval set
         import random
         from datasets import load_dataset
-        main_ = load_dataset("Idavidrein/gpqa", "gpqa_main", split="train")
-        dia = {x["Record ID"] for x in load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")}
+        revision = getattr(args, "gpqa_revision", None)
+        main_ = load_dataset("Idavidrein/gpqa", "gpqa_main", split="train", revision=revision)
+        diamond = load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train", revision=revision)
+        dia = {x["Record ID"] for x in diamond}
         rows = [x for x in main_ if x["Record ID"] not in dia]
         rng = random.Random(args.seed)
         rng.shuffle(rows)
@@ -147,6 +152,18 @@ def calib_texts(args, tok, dev):
         ids = tok("\n\n".join(docs), return_tensors="pt").input_ids
         assert ids.shape[1] >= args.n_calib * cl, f"GPQA main-diamond has {ids.shape[1]} tokens"
         print(f"[calib] gpqa main - diamond: {len(rows)} questions, {ids.shape[1]} tokens")
+        if getattr(args, "data_manifest", None):
+            manifest = {"dataset": "Idavidrein/gpqa", "revision": revision,
+                        "main_fingerprint": main_._fingerprint,
+                        "diamond_fingerprint": diamond._fingerprint,
+                        "record_ids_in_order": [x["Record ID"] for x in rows],
+                        "excluded_record_ids": sorted(dia), "seed": args.seed,
+                        "n_calib": args.n_calib, "seq_len": cl, "chat_template": False,
+                        "input_ids": ids[0, :args.n_calib * cl].tolist()}
+            path = Path(args.data_manifest)
+            if path.exists() and json_digest(json.loads(path.read_text())) != json_digest(manifest):
+                raise ValueError("Calibration data changed from the recorded manifest")
+            atomic_json(path, manifest)
         return [ids[:, i * cl:(i + 1) * cl].to(dev) for i in range(args.n_calib)]
     wiki = tok(load_wikitext(args.data_cache, "train")[:4_000_000], return_tensors="pt").input_ids
     if args.calib_data == "wikitext":
@@ -229,7 +246,7 @@ def enable_layer_checkpointing(model):
         layer.forward = fwd
 
 
-def calibrate(model, tok, texts, n_slots, rope, n_pos, seed, device, H, D, target="ce"):
+def calibrate(model, tok, texts, n_slots, rope, n_pos, seed, device, H, D, target="ce", tracking=None):
     """Fill the shared slot-major buffer {k,v,gk,gv}: [n_slots, N, 1, H, P, D] bf16.
 
     Samples are written straight into the preallocated buffer rather than stacked: for the 2.6B
@@ -247,6 +264,7 @@ def calibrate(model, tok, texts, n_slots, rope, n_pos, seed, device, H, D, targe
     print(f"[calib] buffer {4 * buf['k'].nbytes / 2**30:.1f} GiB "
           f"({n_slots} slots x {len(texts)} seq x {P} pos)", flush=True)
 
+    started = time.monotonic()
     for n, ids in enumerate(texts):
         cache = FisherCache(n_slots)
         o = None
@@ -302,10 +320,16 @@ def calibrate(model, tok, texts, n_slots, rope, n_pos, seed, device, H, D, targe
         del cache
         torch.cuda.empty_cache()
         print(f"    calib {n+1}/{len(texts)}: {S} tok -> {len(keep)} positions", flush=True)
+        if tracking:
+            elapsed = time.monotonic() - started
+            tracking.log({"calibration/completed_sequences": n + 1,
+                          "calibration/total_sequences": len(texts),
+                          "calibration/elapsed_seconds": elapsed,
+                          "calibration/eta_seconds": elapsed / (n + 1) * (len(texts) - n - 1)})
     return buf
 
 
-def load_or_calibrate(args, n_slots, H, D, dev):
+def load_or_calibrate(args, n_slots, H, D, dev, tracking=None):
     """Build the calibration buffer, or mmap it from --calib-cache.
 
     The calibration does not depend on G or the method. Fitting several bundles in parallel would
@@ -339,7 +363,7 @@ def load_or_calibrate(args, n_slots, H, D, dev):
     if args.grad_ckpt:
         enable_layer_checkpointing(model)
     buf = calibrate(model, tok, texts, n_slots, rope, args.calib_positions, args.seed, dev, H, D,
-                    target=args.calib_target)
+                    target=args.calib_target, tracking=tracking)
     print(f"[calib] done in {time.time()-t0:.0f}s")
     del model, texts; torch.cuda.empty_cache()
 
@@ -679,7 +703,11 @@ def main():
                          "matches, calibration needs no backward pass")
     ap.add_argument("--calib-only", action="store_true",
                     help="build --calib-cache and exit (once, before parallel fits)")
+    ap.add_argument("--gpqa-revision", help="pin the GPQA dataset repository revision")
+    ap.add_argument("--data-manifest", help="local calibration IDs/token IDs; never uploaded to W&B")
+    add_tracking_args(ap)
     args = ap.parse_args()
+    tracking = Tracking(args, "calibration" if args.calib_only else "fit", vars(args))
     global UNIFORM_W, ATTN, ATTN_W, LS_POW, FISHER_NORM, FISHER_POOL, FISHER_POW
     FISHER_NORM = args.fisher_norm_fix
     FISHER_POOL, FISHER_POW = args.fisher_pool, args.fisher_pow
@@ -715,9 +743,10 @@ def main():
     assert D % G == 0
     print(f"[cfg] L={L_base} T={T} slots={n_slots} (plain {plain_slots}) H={H} D={D} G={G} K={K}")
 
-    buf = load_or_calibrate(args, n_slots, H, D, dev)
+    buf = load_or_calibrate(args, n_slots, H, D, dev, tracking=tracking)
     if args.calib_only:
         print(f"[done] calib only -> {args.calib_cache}")
+        tracking.finish(0)
         return
     samples = calib_views(buf)
     cl = args.calib_seq_len
@@ -804,6 +833,13 @@ def main():
                     if (l + 1) % 6 == 0:
                         print(f"    {kind}(loopvq): block {blk+1}/{T // Tc} base layer "
                               f"{l+1}/{L_base} ({time.time()-t0:.0f}s)", flush=True)
+                    completed = blk * L_base + l + 1
+                    total = (T // Tc) * L_base
+                    tracking.log({f"fit_{kind}/completed_layers": completed,
+                                  f"fit_{kind}/total_layers": total,
+                                  f"fit_{kind}/elapsed_seconds": time.time() - t0,
+                                  f"fit_{kind}/eta_seconds": (time.time() - t0) / completed * (total - completed),
+                                  f"fit_{kind}/kmeans_iterations": args.kmeans_iters})
                     torch.cuda.empty_cache()
             for slot in plain_slots:
                 # no loop axis: an ordinary per-slot code of G channels at the same bit rate, fit
@@ -917,6 +953,7 @@ def main():
                  else "slot axis = ut*L + layer: an independent codebook per loop step (per-step baseline)"),
     }, indent=2, ensure_ascii=False))
     print(f"[done] -> {out}")
+    tracking.finish(0)
 
 
 if __name__ == "__main__":
