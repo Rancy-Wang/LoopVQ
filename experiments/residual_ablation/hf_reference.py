@@ -25,6 +25,15 @@ from residual_codec import encode_residual, decode_residual
 from reproduction_tracking import atomic_json
 
 
+def select_attention_backend():
+    # PyTorch's automatic dispatcher changes kernels when graph padding adds a
+    # mask. Use one implementation in both the eager oracle and captured path.
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_math_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_cudnn_sdp(False)
+
+
 class CoupledCodec:
     def __init__(self, bundle, rank, world):
         self.books = []
@@ -140,6 +149,12 @@ class GraphDecode:
         self.graphs = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.max_error = 0.0
+
+    def close(self):
+        torch.cuda.synchronize()
+        for graph, _, _ in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
 
     def decode(self, tokens):
         length = self.cache.get_seq_length()
@@ -265,6 +280,7 @@ def main():
     rank = int(os.environ.get('LOCAL_RANK', '0'))
     world = int(os.environ.get('WORLD_SIZE', '1'))
     torch.cuda.set_device(rank)
+    select_attention_backend()
     options = {'tp_plan': 'auto'} if world > 1 else {'device_map': 'cuda'}
     model = AutoModelForCausalLM.from_pretrained(args.model, trust_remote_code=True,
         dtype=torch.bfloat16, attn_implementation='sdpa', **options).eval()
@@ -314,6 +330,8 @@ def main():
             atomic_json(args.output, result)
             print('SMOKE_OK', result['audit']['tp'], result['audit']['local_heads'], flush=True)
         if dist.is_initialized():
+            if runner:
+                runner.close()
             dist.destroy_process_group()
         return
     requests = queue.Queue()

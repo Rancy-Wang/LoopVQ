@@ -7,7 +7,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from hf_reference import CoupledCodec, Coded, cache_class, encode_residual, decode_residual, atomic_json
+from hf_reference import (CoupledCodec, Coded, cache_class, encode_residual,
+                          decode_residual, atomic_json, select_attention_backend)
 
 
 @torch.inference_mode()
@@ -20,6 +21,7 @@ def main():
     args = ap.parse_args()
     rank, world = int(os.environ['LOCAL_RANK']), int(os.environ['WORLD_SIZE'])
     torch.cuda.set_device(rank)
+    select_attention_backend()
     model = AutoModelForCausalLM.from_pretrained(args.model, trust_remote_code=True,
         dtype=torch.bfloat16, attn_implementation='sdpa', tp_plan='auto').eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
