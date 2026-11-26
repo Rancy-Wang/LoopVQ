@@ -18,3 +18,9 @@ Introduce the opt-in fixed INT4 residual codec and residual-aware forward in the
 ## Connections
 
 X5 PTY25245, master /tmp/loopvq-residual-20261126-x5.sock. A10 PTY10517, A11 PTY78624, A12 PTY82582, A13 PTY58348. All target masters use the same X5 channel. Remote resource snapshots are refreshed before each launch.
+
+Candidate1 99951b9 passed compilation. Local Python lacks torch; the three codec tests ran on A10 CPU and CUDA GPU4 and exited0. Residual-aware continuation started on A10 GPU4, ordinary continuation on A12 GPU4, each from the same final original bundle with the unmodified four-epoch optimizer recipe. Online W&B runs dcbebws8 and 9dvetlbu. Initial held-out KL approximately .0034 and .0478 respectively. These are cache-substitution KL values, not accuracy scores.
+
+## Candidate 2/10
+
+Add an independent Transformers TP2 accuracy reference with a preallocated materialized KV cache. Quantize only complete pages leaving the fixed 8+64 high-precision window. Encode all four loop states jointly only after a full forward has produced them. Reconstruction uses the same Coded BF16 gather and FP32 RoPE inverse/reapply as the original training. The codec is applied to the student's own generated KV. All ablation arms use the same model arithmetic and cache interface. Materializing decoded KV is deliberate for this accuracy-only experiment; it is not a compressed-memory or optimized-throughput measurement. Verify actual head partitioning and teacher logits against the native cache before launching evaluation.
