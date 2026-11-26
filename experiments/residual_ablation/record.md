@@ -50,3 +50,9 @@ Candidate5 diagnostics: profiling a matching TP2-local attention shape shows dyn
 ## Candidate 6/10
 
 Fix the confound by explicitly selecting PyTorch efficient SDPA for both dynamic eager and graph modes in the standalone accuracy reference. Re-run original strict greedy, repeated-request, boundary and captured/eager logit assertions for every arm; do not remove the failing assertion. Destroy graph objects before NCCL process groups to fix owned-worker cleanup. Native cache validation must also be rerun under this explicit backend. This changes the documented independent inference protocol; all arms share it, while original KL training remains unchanged. Full evaluation orchestration follows only after these checks pass.
+
+Candidate6 bca9024: BF16, original VQ, original+INT4 and ordinary-continued VQ graph checks passed all original assertions and exited0. The residual-ft check is checked separately before launch. Native cache/export/layout validation under explicit efficient SDPA passed exit0 on A13 GPU6/7. A direct attention check at lengths250/255/256/257/300 is bit-exact with and without padding under this backend. Explicit graph reset resolved distributed teardown for completed checks.
+
+## Candidate 7/10
+
+Implement the previously planned accuracy worker and progress recording. Preserve the successful model path and original scorer protocols. Launch only after all five candidate6 graph outputs and the independent validation are present with exit0. Recheck free GPUs, host memory, ports, clean Git SHA, model/bundle hashes and frozen training recipe. Run short real HTTP/scoring audits, then full five benchmarks x seeds0/1/2. Accuracy cells and raw responses persist outside Git; W&B receives aggregates only. No efficiency metrics are measured. Review actual completed response evidence before reporting jobs started successfully.

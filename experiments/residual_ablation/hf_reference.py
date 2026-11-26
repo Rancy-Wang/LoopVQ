@@ -198,7 +198,8 @@ class GraphDecode:
 
 
 @torch.inference_mode()
-def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None, trace=None, forced=None):
+def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None, trace=None, forced=None,
+             progress_path=None):
     prompt = tokenizer.apply_chat_template(payload['messages'], tokenize=True,
                                            add_generation_prompt=True, enable_thinking=True)
     maximum = int(payload.get('max_tokens', 32768))
@@ -221,6 +222,12 @@ def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None
         stops = [stops]
     finish = 'length'
     started = time.time()
+    def progress(status):
+        if progress_path and (not dist.is_initialized() or dist.get_rank() == 0):
+            atomic_json(progress_path, {'status': status, 'prompt_tokens': len(prompt),
+                'generated_tokens': len(emitted), 'maximum': maximum, 'seed': seed,
+                'started_unix': started, 'updated_unix': time.time()})
+    progress('prefill')
     for _ in range(maximum):
         if runner and emitted:
             raw_logits = runner.decode(tokens)
@@ -245,6 +252,8 @@ def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None
             chosen.fill_(forced[len(emitted)])
         value = int(chosen.item())
         emitted.append(value)
+        if len(emitted) == 1 or len(emitted) % 128 == 0:
+            progress('decode')
         tokens = chosen
         if value in eos:
             finish = 'stop'
@@ -255,6 +264,7 @@ def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None
     text = tokenizer.decode(emitted, skip_special_tokens=True)
     for stop in stops:
         text = text.split(stop, 1)[0]
+    progress('finished')
     return {'id': 'chatcmpl-' + uuid.uuid4().hex, 'object': 'chat.completion',
             'created': int(time.time()), 'model': 'Ouro-2.6B-Thinking',
             'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': text},
@@ -361,14 +371,17 @@ def main():
         server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         atomic_json(args.output, {'status': 'ready', 'tp': world, 'port': args.port,
-                                 'model': args.model, 'bundle': args.bundle, 'residual': args.residual})
+            'model': args.model, 'bundle': args.bundle, 'residual': args.residual,
+            'attention_backend': 'pytorch_efficient_sdpa', 'total_ut_steps': 4,
+            'cuda_graph': bool(runner), 'prefix_tokens': 8, 'recent_tokens': 64})
     while True:
         payload, reply = requests.get() if rank == 0 else (None, None)
         shared = [payload]
         if world > 1:
             dist.broadcast_object_list(shared, src=0)
         try:
-            result = generate(model, tokenizer, cache_type, codec, args.residual, shared[0], runner)
+            result = generate(model, tokenizer, cache_type, codec, args.residual, shared[0], runner,
+                              progress_path=args.output + '.progress.json')
         except Exception as exc:
             # Preserve the traceback and terminate all ranks on a model failure.
             if reply is not None:

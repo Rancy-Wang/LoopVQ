@@ -159,6 +159,8 @@ class AuditProxy:
                 if choices[0].get("finish_reason") not in ("stop", "length"):
                     raise ValueError(f"Unexpected finish_reason: {choices[0].get('finish_reason')}")
                 usage = body.get("usage", {})
+                if 'audit' in body and body['audit'].get('input_ids') != ids:
+                    raise ValueError('Server input token IDs differ from the client template')
                 if usage.get("prompt_tokens") != len(ids):
                     raise ValueError(f"Server prompt_tokens={usage.get('prompt_tokens')} "
                                      f"but reconstructed input has {len(ids)} tokens")

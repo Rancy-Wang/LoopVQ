@@ -90,7 +90,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="exact local checkpoint used by the server")
     parser.add_argument("--base-url", required=True, help="server root, e.g. http://127.0.0.1:30000")
-    parser.add_argument("--method", required=True, choices=("bf16", "loopvq_0.5bit"))
+    parser.add_argument("--method", required=True, choices=("bf16", "loopvq_0.5bit",
+        "loopvq_residual4", "loopvq_plain_continued", "loopvq_residual_ft"))
     parser.add_argument("--server-manifest", required=True,
                         help="JSON: method, sglang_git_sha, model_sha256, total_ut_steps; "
                              "quantized server also requires bundle_sha256")
