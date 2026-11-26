@@ -73,3 +73,14 @@ Candidate8 d74647a passed four CPU tests locally and remotely. Extra BF16/VQ wor
 ## Candidate 9/10
 
 Correct the cell worker's port preflight to use SO_REUSEADDR, matching HTTPServer, while still rejecting an active listener. No inference, benchmark, recipe, ownership or output-budget changes. Add an actual local socket test covering an active listener and recently closed accepted connection. Compile and rerun CPU tests, synchronize through test, and restart only workers that stopped at this known port preflight after a verified drain. Preserve original recipes and confirm cached answers are replayed, not regenerated. Existing helpers and in-flight drains remain undisturbed.
+
+Candidate9 7fe769b passed five local/remote CPU tests. Original VQ and ordinary continuation resumed with replayed=3, failed=0; residual-aware continuation also resumed. Seven TP2 workers remain active. Long responses are preserved during drain.
+
+## Candidate 10/10 — diagnose slow accuracy generation
+
+1. Purpose: answer the user's actual-sample-count, ETA and slow-evaluator questions with measured evidence.
+2. Steps: audit durable full responses and current in-flight progress; measure existing tokenizer stop checking on saved output IDs; run short stage timings and CUDA kernel profiling on a newly free A12 GPU2/3 pair.
+3. Scope: add profile_reference.py only; import the unchanged validated hf_reference model/cache/codec/graph implementation. No training, scoring, production server, sampling protocol or in-flight request changes.
+4. Success: report full-answer counts separately from scored cells; show wall/GPU stage timings at 2K/8K/16K synthetic cache histories, including graph padding, reconstruction, sampling synchronization and Python overhead. State synthetic-context and profiler-overhead limitations. ETA is conditional on observed workload, not a promise.
+5. Risks: competing GPU allocation, profiler perturbation, synthetic KV versus real samples, completed-short-answer bias. Recheck resources and stop diagnostic on failure; do not disturb existing workers or count synthetic outputs as accuracy samples.
+6. Validation: py_compile, diff check, Git test branch sync and SHA verification; existing five CPU tests; TP2 diagnostic via tmux with exit marker and per-point JSON. CUDA events plus wall timing, a separate CUDA profiler pass; all original inference/scorer sources must remain identical to3df02ee. This is the final authorized candidate; further fixes require a new explicit iteration budget.
