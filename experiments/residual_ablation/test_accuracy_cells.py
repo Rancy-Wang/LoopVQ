@@ -1,5 +1,6 @@
 import json
 import signal
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import patch
 from accuracy_cells import (ARMS, BASE_SHA, atomic_json, claim, collect_cell,
                             file_hash, initialize, key, register_done)
 from summarize_accuracy import summarize
-from cell_worker import drain
+from cell_worker import check_port_available, drain
 
 
 class CellTests(unittest.TestCase):
@@ -108,6 +109,20 @@ class CellTests(unittest.TestCase):
         self.assertEqual(actions[0], ('signal', 12346, signal.SIGSTOP))
         self.assertLess(actions.index('saved'), actions.index(('group', 12345, signal.SIGTERM)))
         self.assertTrue((job / 'drain-complete.json').exists())
+
+    def test_port_probe_rejects_listener_but_allows_released_connection(self):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(('127.0.0.1', 0))
+            port = listener.getsockname()[1]
+            listener.listen()
+            with self.assertRaises(OSError):
+                check_port_available(port)
+            with socket.create_connection(('127.0.0.1', port)) as client:
+                accepted, _ = listener.accept()
+                accepted.close()
+                self.assertEqual(client.recv(1), b'')
+        check_port_available(port)
 
 
 if __name__ == '__main__':

@@ -24,6 +24,14 @@ def command_line(pid):
         return ''
 
 
+def check_port_available(port):
+    with socket.socket() as probe:
+        # Match HTTPServer's binding rules: TIME_WAIT from this worker's old
+        # connection is harmless; an actual listening service still blocks bind.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(('127.0.0.1', port))
+
+
 def drain(root, arm, state_path):
     job = root / 'jobs' / arm
     marker = job / 'drain-complete.json'
@@ -141,8 +149,7 @@ def main():
                 busy = output(['nvidia-smi', '-i', args.gpus, '--query-compute-apps=pid', '--format=csv,noheader'])
                 if busy:
                     raise RuntimeError(f'GPU pair is occupied: {args.gpus}, PIDs={busy}')
-                with socket.socket() as probe:
-                    probe.bind(('127.0.0.1', args.port))
+                check_port_available(args.port)
                 state['gpu_snapshot'] = output(['nvidia-smi', '-i', args.gpus,
                     '--query-gpu=index,uuid,name,memory.used,memory.total', '--format=csv,noheader'])
                 state['host_memory'] = output(['free', '-h'])
