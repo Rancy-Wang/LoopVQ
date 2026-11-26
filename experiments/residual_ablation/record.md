@@ -24,3 +24,9 @@ Candidate1 99951b9 passed compilation. Local Python lacks torch; the three codec
 ## Candidate 2/10
 
 Add an independent Transformers TP2 accuracy reference with a preallocated materialized KV cache. Quantize only complete pages leaving the fixed 8+64 high-precision window. Encode all four loop states jointly only after a full forward has produced them. Reconstruction uses the same Coded BF16 gather and FP32 RoPE inverse/reapply as the original training. The codec is applied to the student's own generated KV. All ablation arms use the same model arithmetic and cache interface. Materializing decoded KV is deliberate for this accuracy-only experiment; it is not a compressed-memory or optimized-throughput measurement. Verify actual head partitioning and teacher logits against the native cache before launching evaluation.
+
+Candidate2 1cb8c87: TP2 smokes passed on A12 (BF16 and original VQ) and A13 (VQ+residual), all exit0 and 8 local KV heads per rank. Training completed exit0 for both arms. Residual best validation KL .003168791386997327 at epoch1; ordinary continuation .0432494948618114 at epoch4. Training token SHA256 matches original: 2b6633839f961a1af46264bb50ae8b5fc877124dcaf2ab518d536986a90c1d6e.
+
+## Candidate 3/10
+
+Add independent codec-layout, exported-checkpoint and native-cache logit validation before full evaluation. Make evaluation manifest identify the actual Transformers reference rather than SGLang. Keep historical SGLang evaluation defaults compatible. Accuracy generation remains TP2, R4, HP8+64; this window differs from earlier HP64+256 accuracy experiments, so those outputs are not reused. Original GPQA-minus-Diamond calibration recipe remains sink8 (without a recent-window exception), as published and previously used.

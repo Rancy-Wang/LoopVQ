@@ -111,7 +111,9 @@ def main():
         parser.error("Use unique seeds from 0/1/2, positive concurrency and positive audit budget")
     model = Path(args.model).resolve()
     server = json.loads(Path(args.server_manifest).read_text())
-    required = ("method", "sglang_git_sha", "model_sha256", "total_ut_steps")
+    implementation = server.get("implementation", "sglang")
+    revision_key = "inference_git_sha" if implementation == "transformers_reference" else "sglang_git_sha"
+    required = ("method", revision_key, "model_sha256", "total_ut_steps")
     if any(not server.get(k) for k in required) or server["total_ut_steps"] != 4 or server["method"] != args.method:
         raise ValueError("Server manifest missing identity fields or does not match full-depth method")
     if args.method != "bf16" and not server.get("bundle_sha256"):
@@ -159,7 +161,8 @@ def main():
                              group=args.wandb_group, job_type="http-audit" if args.audit else "accuracy",
                              name=f"{args.method}-{'audit' if args.audit else 'accuracy'}", mode="online",
                              config={"recipe_sha256": digest(recipe), "method": args.method,
-                                     "sglang_git_sha": server["sglang_git_sha"],
+                                     "implementation": implementation,
+                                     revision_key: server[revision_key],
                                      "api_seed_mode": args.api_seed_mode},
                              settings=wandb.Settings(disable_code=True, console="off"))
             if run.offline:
