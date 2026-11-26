@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from residual_codec import encode_residual, decode_residual
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from build_ouro_bundle import calib_texts, enable_layer_checkpointing, load_wikitext, make_fisher_cache_cls
@@ -179,6 +180,8 @@ def main():
     ap.add_argument("--provenance-manifest", help="immutable model/data/source manifest used for resume validation")
     ap.add_argument("--checkpoint", help="atomically save a complete epoch boundary here")
     ap.add_argument("--resume", help="restore an epoch boundary, including Adam and RNG state")
+    ap.add_argument("--residual-bits", type=int, choices=(0, 4), default=0,
+                    help="opt-in detached symmetric INT4 group32 residual reconstruction")
     add_tracking_args(ap)
     a = ap.parse_args()
     if not 0 < a.n_val < a.n_calib:
@@ -200,6 +203,9 @@ def main():
     tr, va = texts[:a.n_calib - a.n_val], texts[a.n_calib - a.n_val:]
     src = ART / a.src
     qk, qv = Coded(src / "codebook.pt", dev), Coded(src / "vq_v_codebook.pt", dev)
+    if a.residual_bits and any(not q.ident or q.norm or q.ls is not None or q.cw is not None
+                               for q in (qk, qv)):
+        raise ValueError("Residual ablation requires the original pure LoopVQ identity bundle")
     rf = torch.load(src / "v_rotation_sst_r_h_pbr.pt", map_location="cpu", weights_only=False)
     assert rf.get("objective", "identity") == "identity", "V rotation bundles not handled here"
     params = ([qk.cb] if "k" in a.train else []) + ([qv.cb] if "v" in a.train else [])
@@ -226,22 +232,37 @@ def main():
     def encode(kpost, vv):
         """post-RoPE K / V [L,H,S,D] -> codes and scales under the current codebooks"""
         enc = []
+        residuals = []
         # per token chunk (every step is per token): full-slot fp32 copies are 1.6 GB on 1.4B
         # and 3.2 GB on 2.6B at 2048 tokens, and unrope makes several
         for sl in chunks:
             kx = rope.unrope(kpost[:, :, sl].float(), (cos[:, sl], sin[:, sl])).permute(0, 2, 1, 3)
             rk, sk_ = qk.to_coded(kx); del kx
             rv, sv_ = qv.to_coded(vv[:, :, sl].float().permute(0, 2, 1, 3))
-            enc.append((qk.assign(rk), sk_, qv.assign(rv), sv_)); del rk, rv
+            ik, iv = qk.assign(rk), qv.assign(rv)
+            enc.append((ik, sk_, iv, sv_))
+            if a.residual_bits:
+                residuals.append((encode_residual(rk, qk.decode(ik)),
+                                  encode_residual(rv, qv.decode(iv))))
+            del rk, rv
         cat1 = lambda xs: None if xs[0] is None else torch.cat(xs, 1)
-        return tuple(cat1([e[j] for e in enc]) for j in range(4))
+        codes = tuple(cat1([e[j] for e in enc]) for j in range(4))
+        if a.residual_bits:
+            joined = tuple(tuple(torch.cat([item[kind][part] for item in residuals], 1)
+                                 for part in range(2)) for kind in range(2))
+            return codes + joined
+        return codes
 
     def rebuild(codes, sl):
         """served K (post-RoPE) / V rows [L,H,s,D] of token slice sl, differentiable in cb"""
-        ik, sk, iv, sv = codes
-        kr = qk.from_coded(qk.decode(ik[:, sl]), None if sk is None else sk[:, sl]).permute(0, 2, 1, 3)
+        ik, sk, iv, sv = codes[:4]
+        k_decoded, v_decoded = qk.decode(ik[:, sl]), qv.decode(iv[:, sl])
+        if a.residual_bits:
+            k_decoded = k_decoded + decode_residual(tuple(t[:, sl] for t in codes[4]))
+            v_decoded = v_decoded + decode_residual(tuple(t[:, sl] for t in codes[5]))
+        kr = qk.from_coded(k_decoded, None if sk is None else sk[:, sl]).permute(0, 2, 1, 3)
         kr = kr * cos[:, sl] + rotate_half(kr) * sin[:, sl]                # cos [1,S,D]
-        vr = qv.from_coded(qv.decode(iv[:, sl]), None if sv is None else sv[:, sl]).permute(0, 2, 1, 3)
+        vr = qv.from_coded(v_decoded, None if sv is None else sv[:, sl]).permute(0, 2, 1, 3)
         return kr, vr
 
     @torch.no_grad()
@@ -393,6 +414,9 @@ def main():
                   src_files={p.name: file_sha256(p) for p in src.iterdir() if p.is_file()},
                   input_ids_sha256=hashlib.sha256(b"".join(x.cpu().numpy().tobytes() for x in texts)).hexdigest(),
                   provenance_sha256=file_sha256(a.provenance_manifest) if a.provenance_manifest else None)
+    if a.residual_bits:
+        recipe["residual"] = {"bits": 4, "group_size": 32, "scale_dtype": "float16",
+                              "codes": "symmetric_-7_7", "gradient": "detached_residual"}
     tracking = Tracking(a, "finetune", recipe)
     start_epoch, n_step, prior_elapsed = 0, 0, 0.0
     if a.resume:
@@ -480,6 +504,8 @@ def main():
                             "held_out_kl": best, "held_out_joint_kl": joint, "compound": a.compound,
                             "objective": "final-loop KL(p_clean || p_quant)" if a.objective == "joint"
                             else "sum_t KL(p_clean || p_quant, only loop step t quantized)"}
+    if a.residual_bits:
+        info["residual"] = recipe["residual"]
     atomic_json(dst / "build_info.json", info)
     print(f"[e2e] best held-out KL {best:.4f} -> {dst}")
     tracking.finish(0)
