@@ -183,7 +183,7 @@ class GraphDecode:
 
 
 @torch.inference_mode()
-def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None):
+def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None, trace=None, forced=None):
     prompt = tokenizer.apply_chat_template(payload['messages'], tokenize=True,
                                            add_generation_prompt=True, enable_thinking=True)
     maximum = int(payload.get('max_tokens', 32768))
@@ -213,6 +213,8 @@ def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None
             raw_logits = model(tokens, past_key_values=cache, use_cache=True, logits_to_keep=1).logits
         cache.finish_forward()
         logits = raw_logits[:, -1].float()
+        if trace is not None:
+            trace.append(logits.cpu())
         if temperature == 0:
             chosen = logits.argmax(-1, keepdim=True)
         else:
@@ -224,6 +226,8 @@ def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None
             chosen = indices.gather(-1, pick)
         if dist.is_initialized():
             dist.broadcast(chosen, 0)
+        if forced is not None:
+            chosen.fill_(forced[len(emitted)])
         value = int(chosen.item())
         emitted.append(value)
         tokens = chosen
@@ -284,8 +288,22 @@ def main():
                     tokenize=True, add_generation_prompt=True, enable_thinking=True)) < 250:
                 content += ' blue'
             boundary['messages'] = [{'role': 'user', 'content': content}]
-            padded = generate(model, tokenizer, cache_type, codec, args.residual, boundary, runner)
-            direct = generate(model, tokenizer, cache_type, codec, args.residual, boundary)
+            graph_trace, direct_trace = [], []
+            padded = generate(model, tokenizer, cache_type, codec, args.residual, boundary, runner, graph_trace)
+            direct = generate(model, tokenizer, cache_type, codec, args.residual, boundary, trace=direct_trace)
+            if padded['audit']['output_ids'] != direct['audit']['output_ids']:
+                forced_trace = []
+                generate(model, tokenizer, cache_type, codec, args.residual, boundary,
+                    trace=forced_trace, forced=padded['audit']['output_ids'])
+                diagnostic = {'graph_ids': padded['audit']['output_ids'], 'eager_ids': direct['audit']['output_ids'],
+                    'steps': [{'max_abs_logit_error': (a - b).abs().max().item(),
+                               'top5_graph': a.topk(5).indices.tolist(),
+                               'top5_eager': b.topk(5).indices.tolist(),
+                               'values_graph': a.topk(5).values.tolist(),
+                               'values_eager': b.topk(5).values.tolist()}
+                              for a, b in zip(graph_trace, forced_trace)]}
+                if rank == 0:
+                    atomic_json(args.output + '.divergence.json', diagnostic)
             assert padded['audit']['output_ids'] == direct['audit']['output_ids']
             assert {256, 512}.issubset(runner.graphs)
             result['audit']['graph_eager_max_error'] = runner.max_error
