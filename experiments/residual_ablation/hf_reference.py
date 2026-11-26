@@ -66,12 +66,19 @@ def cache_class(model):
             self.storage = {}
             self.lengths = {}
             self.quant_end = prefix
+            self.graph_size = 0
             self.rope = RopeInverter(model.model.rotary_emb)
 
         def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+            if self.graph_size:
+                keys, values = self.storage[layer_idx]
+                positions = cache_kwargs['cache_position']
+                keys.index_copy_(2, positions, key_states)
+                values.index_copy_(2, positions, value_states)
+                return keys[:, :, :self.graph_size], values[:, :, :self.graph_size]
             if layer_idx not in self.storage:
                 shape = (*key_states.shape[:2], self.capacity, key_states.shape[-1])
-                self.storage[layer_idx] = (key_states.new_empty(shape), value_states.new_empty(shape))
+                self.storage[layer_idx] = (key_states.new_zeros(shape), value_states.new_zeros(shape))
                 self.lengths[layer_idx] = 0
             start = self.lengths[layer_idx]
             end = start + key_states.shape[2]
@@ -87,6 +94,16 @@ def cache_class(model):
             self.key_cache[layer_idx], self.value_cache[layer_idx] = keys[:, :, :end], values[:, :, :end]
             self._seen_tokens = end
             return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+        def reset(self):
+            self.quant_end = self.prefix
+            self.advance(0)
+
+        def advance(self, length):
+            for slot, (keys, values) in self.storage.items():
+                self.key_cache[slot], self.value_cache[slot] = keys[:, :, :length], values[:, :, :length]
+                self.lengths[slot] = length
+            self._seen_tokens = length
 
         @torch.no_grad()
         def finish_forward(self):
@@ -114,8 +131,59 @@ def cache_class(model):
     return PageCache
 
 
+class GraphDecode:
+    """Reusable full-depth decode graphs; quantization still runs outside capture."""
+    def __init__(self, model, cache, verify=False):
+        self.model, self.cache, self.verify = model, cache, verify
+        self.tokens = torch.zeros((1, 1), dtype=torch.long, device='cuda')
+        self.position = torch.zeros(1, dtype=torch.long, device='cuda')
+        self.graphs = {}
+        self.pool = torch.cuda.graph_pool_handle()
+        self.max_error = 0.0
+
+    def decode(self, tokens):
+        length = self.cache.get_seq_length()
+        bucket = next(n for n in (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 40960) if n > length)
+        assert bucket <= self.cache.capacity
+        self.tokens.copy_(tokens)
+        self.position.fill_(length)
+        self.cache.graph_size = bucket
+        if bucket not in self.graphs:
+            indices = torch.arange(bucket, device='cuda')
+
+            def forward():
+                mask = torch.where(indices <= self.position, 0.0, torch.finfo(torch.bfloat16).min)
+                mask = mask.to(torch.bfloat16).view(1, 1, 1, bucket)
+                return self.model(self.tokens, past_key_values=self.cache, use_cache=True,
+                    cache_position=self.position, position_ids=self.position.unsqueeze(0),
+                    attention_mask={'full_attention': mask}, logits_to_keep=1).logits
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    forward()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self.pool, stream=stream):
+                result = forward()
+            self.graphs[bucket] = (graph, result, forward)
+        graph, result, forward = self.graphs[bucket]
+        graph.replay()
+        if self.verify:
+            observed = result.clone()
+            expected = forward()
+            error = (observed.float() - expected.float()).abs().max().item()
+            self.max_error = max(self.max_error, error)
+            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+        self.cache.graph_size = 0
+        self.cache.advance(length + 1)
+        return result
+
+
 @torch.inference_mode()
-def generate(model, tokenizer, cache_type, codec, residual, payload):
+def generate(model, tokenizer, cache_type, codec, residual, payload, runner=None):
     prompt = tokenizer.apply_chat_template(payload['messages'], tokenize=True,
                                            add_generation_prompt=True, enable_thinking=True)
     maximum = int(payload.get('max_tokens', 32768))
@@ -124,7 +192,9 @@ def generate(model, tokenizer, cache_type, codec, residual, payload):
     seed = int(payload.get('seed', 0))
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    cache = cache_type(len(prompt) + maximum, codec, residual)
+    cache = runner.cache if runner else cache_type(len(prompt) + maximum, codec, residual)
+    if runner:
+        cache.reset()
     tokens = torch.tensor([prompt], device='cuda')
     emitted = []
     temperature = float(payload.get('temperature', 1))
@@ -137,9 +207,12 @@ def generate(model, tokenizer, cache_type, codec, residual, payload):
     finish = 'length'
     started = time.time()
     for _ in range(maximum):
-        output = model(tokens, past_key_values=cache, use_cache=True, logits_to_keep=1)
+        if runner and emitted:
+            raw_logits = runner.decode(tokens)
+        else:
+            raw_logits = model(tokens, past_key_values=cache, use_cache=True, logits_to_keep=1).logits
         cache.finish_forward()
-        logits = output.logits[:, -1].float()
+        logits = raw_logits[:, -1].float()
         if temperature == 0:
             chosen = logits.argmax(-1, keepdim=True)
         else:
@@ -182,6 +255,8 @@ def main():
     ap.add_argument('--port', type=int, default=32801)
     ap.add_argument('--output', required=True)
     ap.add_argument('--smoke', action='store_true')
+    ap.add_argument('--cuda-graph', action='store_true')
+    ap.add_argument('--verify-graph', action='store_true')
     args = ap.parse_args()
     rank = int(os.environ.get('LOCAL_RANK', '0'))
     world = int(os.environ.get('WORLD_SIZE', '1'))
@@ -193,14 +268,35 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     codec = CoupledCodec(args.bundle, rank, world) if args.bundle else None
     cache_type = cache_class(model)
+    runner = GraphDecode(model, cache_type(40960, codec, args.residual), args.verify_graph) if args.cuda_graph else None
     if args.smoke:
         payload = {'messages': [{'role': 'user', 'content': 'Explain why the sky is blue. ' * 12}],
                    'temperature': 0, 'max_tokens': 16}
-        result = generate(model, tokenizer, cache_type, codec, args.residual, payload)
+        result = generate(model, tokenizer, cache_type, codec, args.residual, payload, runner)
+        if args.verify_graph:
+            eager = generate(model, tokenizer, cache_type, codec, args.residual, payload)
+            assert result['audit']['output_ids'] == eager['audit']['output_ids']
+            repeated = generate(model, tokenizer, cache_type, codec, args.residual, payload, runner)
+            assert result['audit']['output_ids'] == repeated['audit']['output_ids']
+            boundary = dict(payload)
+            content = 'Explain why the sky is blue.'
+            while len(tokenizer.apply_chat_template([{'role': 'user', 'content': content}],
+                    tokenize=True, add_generation_prompt=True, enable_thinking=True)) < 250:
+                content += ' blue'
+            boundary['messages'] = [{'role': 'user', 'content': content}]
+            padded = generate(model, tokenizer, cache_type, codec, args.residual, boundary, runner)
+            direct = generate(model, tokenizer, cache_type, codec, args.residual, boundary)
+            assert padded['audit']['output_ids'] == direct['audit']['output_ids']
+            assert {256, 512}.issubset(runner.graphs)
+            result['audit']['graph_eager_max_error'] = runner.max_error
+            result['audit']['repeat_request_exact'] = True
+            result['audit']['boundary_greedy_exact'] = True
         assert result['audit']['local_heads'] == 16 // world
         if rank == 0:
             atomic_json(args.output, result)
             print('SMOKE_OK', result['audit']['tp'], result['audit']['local_heads'], flush=True)
+        if dist.is_initialized():
+            dist.destroy_process_group()
         return
     requests = queue.Queue()
     if rank == 0:
@@ -236,7 +332,7 @@ def main():
         if world > 1:
             dist.broadcast_object_list(shared, src=0)
         try:
-            result = generate(model, tokenizer, cache_type, codec, args.residual, shared[0])
+            result = generate(model, tokenizer, cache_type, codec, args.residual, shared[0], runner)
         except Exception as exc:
             # Preserve the traceback and terminate all ranks on a model failure.
             if reply is not None:

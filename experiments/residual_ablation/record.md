@@ -30,3 +30,9 @@ Candidate2 1cb8c87: TP2 smokes passed on A12 (BF16 and original VQ) and A13 (VQ+
 ## Candidate 3/10
 
 Add independent codec-layout, exported-checkpoint and native-cache logit validation before full evaluation. Make evaluation manifest identify the actual Transformers reference rather than SGLang. Keep historical SGLang evaluation defaults compatible. Accuracy generation remains TP2, R4, HP8+64; this window differs from earlier HP64+256 accuracy experiments, so those outputs are not reused. Original GPQA-minus-Diamond calibration recipe remains sink8 (without a recent-window exception), as published and previously used.
+
+Candidate3 39a2279 passed TP2 validation on A12 GPU0/1, exit0: native/custom cache logits bit-exact across prefill+4 decode steps; all 48 coupled layers K/V with/without residual match original Coded assign/decode bit-exact; FP16 exported books match selected best checkpoint bit-exact. W&B readback confirms both runs finished and matching training IDs.
+
+## Candidate 4/10
+
+Purpose: remove Python per-layer dispatch from the independent accuracy evaluator so long-generation evaluation is practical. Scope: hf_reference.py, graph validation and evaluation launch scripts only. Add reusable static KV storage and bucketed CUDA graphs, preserving R4, original projection/MLP/attention arithmetic, sampling and codec. Keep eager mode as an oracle; require captured versus uncaptured identical padded arithmetic to be bit-exact, and compare greedy generated IDs against dynamic eager for all three original arms. Record any native-padding rounding difference. Risks: TP collectives in graph capture, masking unused KV, graph reuse across requests, bucket transitions, and capture mutating cache positions. Test two requests and bucket crossings before launching the existing five-benchmark/three-seed harness. No efficiency measurements or SGLang edits.
