@@ -102,6 +102,16 @@ class HTTPAuditTests(unittest.TestCase):
             self.assertEqual(record["finish_reason"], "stop")
             self.assertEqual(record["input_token_ids_source"], "checkpoint_template_reconstruction")
 
+    def test_greedy_rejects_sampled_payload(self):
+        self.expected.update(temperature=0.0, top_p=1.0)
+        self.payload.update(temperature=0.0, top_p=1.0)
+        with self.proxy() as proxy:
+            self.assertEqual(self.post(proxy.url, {**self.payload, "temperature": 1.0})[0], 502)
+            self.assertEqual(len(self.requests), 0)
+            self.assertEqual(self.post(proxy.url)[0], 200)
+        self.assertEqual(self.requests[0]["temperature"], 0.0)
+        self.assertEqual(len(list((self.directory / "responses").glob("*.json"))), 1)
+
     def test_failed_attempt_survives_successful_retry(self):
         self.failures = 1
         with self.proxy() as proxy:

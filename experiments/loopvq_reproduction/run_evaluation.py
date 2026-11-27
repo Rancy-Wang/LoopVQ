@@ -3,7 +3,8 @@
 
 First run --audit --benchmarks aime24 evalplus_humaneval --seeds 0 1.
 Then omit --audit for all five tasks and all three seeds. Both phases use the
-same --root and server manifest. HTTP responses are saved immediately and reused
+same --root and server manifest. --greedy uses only seed0 with temperature0/top_p1
+for both audit and full evaluation. HTTP responses are saved immediately and reused
 after interruption; the official scorers are rerun over the complete sample set.
 """
 import argparse
@@ -60,11 +61,11 @@ def record_audit(coverage, coverage_path, bench, seed, api_seed, marker):
     atomic_json(coverage_path, coverage)
 
 
-def summarize(root, method, run):
+def summarize(root, method, run, greedy=False):
     summary = {"method": method, "cells": {}, "benchmarks": {}}
     for bench in COUNTS:
         values = []
-        for seed in (0, 1, 2):
+        for seed in ((0,) if greedy else (0, 1, 2)):
             directory = root / "full" / bench / str(seed)
             marker = directory / "complete.json"
             if not marker.exists():
@@ -75,14 +76,16 @@ def summarize(root, method, run):
                 raise ValueError(f"Completed cell changed: {directory}")
             values.append(checked["accuracy_percent"])
             summary["cells"][f"{bench}/{seed}"] = checked
-        if len(values) == 3:
+        if greedy and len(values) == 1:
+            summary["benchmarks"][bench] = {"accuracy_percent": values[0], "decoding": "greedy", "n": COUNTS[bench]}
+        elif not greedy and len(values) == 3:
             summary["benchmarks"][bench] = {"mean_accuracy_percent": statistics.mean(values),
                                            "std_accuracy_percent_ddof1": statistics.stdev(values),
                                            "seeds": [0, 1, 2], "n_per_seed": COUNTS[bench]}
             if run:
                 run.log({f"{bench}/mean_accuracy_percent": statistics.mean(values),
                          f"{bench}/std_accuracy_percent_ddof1": statistics.stdev(values)})
-    summary["complete"] = len(summary["cells"]) == 15
+    summary["complete"] = len(summary["cells"]) == (5 if greedy else 15)
     atomic_json(root / "summary.json", summary)
 
 
@@ -97,7 +100,8 @@ def main():
                              "quantized server also requires bundle_sha256")
     parser.add_argument("--root", required=True, help="persistent evaluation directory outside Git")
     parser.add_argument("--benchmarks", nargs="+", choices=tuple(COUNTS), default=list(COUNTS))
-    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument("--seeds", nargs="+", type=int, default=None)
+    parser.add_argument("--greedy", action="store_true", help="temperature=0, top_p=1; one complete run with seed0 metadata")
     parser.add_argument("--api-seed-mode", choices=("explicit", "legacy"), default="explicit")
     parser.add_argument("--num-concurrent", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=172800)
@@ -107,6 +111,11 @@ def main():
     parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT"))
     parser.add_argument("--wandb-group", default="2026-11-23-loopvq-reproduction")
     args = parser.parse_args()
+    if args.seeds is None:
+        args.seeds = [0] if args.greedy else [0, 1, 2]
+    if args.greedy and (args.seeds != [0] or args.api_seed_mode != "explicit"):
+        parser.error("Greedy uses exactly seed0 metadata and explicit API mode")
+    temperature, top_p = (0.0, 1.0) if args.greedy else (1.0, 0.7)
     if (any(seed not in (0, 1, 2) for seed in args.seeds) or args.num_concurrent < 1
             or args.audit_max_tokens < 1 or len(args.seeds) != len(set(args.seeds))):
         parser.error("Use unique seeds from 0/1/2, positive concurrency and positive audit budget")
@@ -132,7 +141,7 @@ def main():
     sources += sorted((REPO / "tasks").glob("aime*/*"))
     sources += sorted((REPO / "tasks" / "gpqa_diamond").glob("*"))
     recipe = {"server": server, "model": str(model), "base_url": args.base_url.rstrip("/"),
-              "api_seed_mode": args.api_seed_mode, "temperature": 1.0, "top_p": 0.7,
+              "api_seed_mode": args.api_seed_mode, "temperature": temperature, "top_p": top_p,
               "max_tokens": 32768, "num_concurrent": args.num_concurrent,
               "tokenizer_files": {p.name: file_hash(p) for p in sorted(model.glob("*"))
                                   if p.is_file() and ("token" in p.name or p.name == "config.json")},
@@ -148,13 +157,13 @@ def main():
         coverage = json.loads(coverage_path.read_text()) if coverage_path.exists() else []
         if not args.audit:
             for kind in {client_kind(b) for b in args.benchmarks}:
-                for seed in (0, 1):
+                for seed in ((0,) if args.greedy else (0, 1)):
                     matches = [x for x in coverage if x["kind"] == kind and x["seed"] == seed
                                and Path(x["marker"]).exists()
                                and file_hash(x["marker"]) == x["marker_sha256"]]
                     if not matches:
                         raise RuntimeError(f"Missing real HTTP audit for {kind} client seed {seed}; "
-                                           "run --audit --benchmarks aime24 evalplus_humaneval --seeds 0 1 first")
+                                           "run matching --audit for both client types first")
         run = None
         if args.wandb_project:
             import wandb
@@ -164,7 +173,8 @@ def main():
                              config={"recipe_sha256": digest(recipe), "method": args.method,
                                      "implementation": implementation,
                                      revision_key: server[revision_key],
-                                     "api_seed_mode": args.api_seed_mode},
+                                     "api_seed_mode": args.api_seed_mode, "temperature": temperature, "top_p": top_p,
+                                     "decoding": "greedy" if args.greedy else "sampling"},
                              settings=wandb.Settings(disable_code=True, console="off"))
             if run.offline:
                 raise RuntimeError("Requested online W&B run is offline")
@@ -186,7 +196,7 @@ def main():
                         if args.audit:
                             record_audit(coverage, coverage_path, bench, seed, api_seed, marker)
                         continue
-                    expected = {"model": str(model), "temperature": 1.0, "top_p": 0.7,
+                    expected = {"model": str(model), "temperature": temperature, "top_p": top_p,
                                 "max_tokens": budget, "seed": api_seed, "stop": None}
                     if client_kind(bench) == "lm_eval":
                         expected["stop"] = (["Question:"] if bench.startswith("aime") else []) + [
@@ -198,7 +208,7 @@ def main():
                         command = [sys.executable, str(scripts[1] if client_kind(bench) == "evalplus" else scripts[0]),
                                    "--base_url", proxy.url, "--model_name", str(model),
                                    "--output_dir", str(directory), "--save_postfix", args.method,
-                                   "--seed", str(seed), "--temperature", "1.0", "--top_p", "0.7",
+                                   "--seed", str(seed), "--temperature", str(temperature), "--top_p", str(top_p),
                                    "--max_gen_toks", str(budget), "--num_concurrent", str(args.num_concurrent),
                                    "--timeout", str(args.timeout)]
                         if client_kind(bench) == "evalplus":
@@ -240,7 +250,7 @@ def main():
                                  f"{bench}/seed{seed}/elapsed_seconds": record["elapsed_seconds"]})
                     print(f"[eval] {'AUDIT' if args.audit else 'FULL'} {bench}/{seed}: {scores}", flush=True)
             if not args.audit:
-                summarize(root, args.method, run)
+                summarize(root, args.method, run, greedy=args.greedy)
         finally:
             if run:
                 run.finish()
